@@ -29,8 +29,36 @@ echo "Done."
 
 # ── STEP 3 — Clean old Gradle global caches ───────
 echo ""
-echo "[3/7] Cleaning Gradle caches older than 30 days..."
-find ~/.gradle/caches -maxdepth 1 -type d -mtime +30 -exec rm -rf {} + 2>/dev/null
+echo "[3/7] Cleaning Gradle caches older than 7 days..."
+find ~/.gradle/caches -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null
+echo "Done."
+
+# ── STEP 3b — Clean old Gradle wrapper versions ───
+echo ""
+echo "[3b] Cleaning old Gradle wrapper versions..."
+if [ -d ~/.gradle/wrapper/dists ]; then
+  ls -t ~/.gradle/wrapper/dists/ 2>/dev/null | tail -n +2 | while read old; do
+    rm -rf ~/.gradle/wrapper/dists/"$old"
+    echo "  Removed wrapper: $old"
+  done
+fi
+echo "Done."
+
+# ── STEP 3c — Clean node_modules from inactive repos ──
+echo ""
+echo "[3c] Cleaning node_modules from repos idle > 7 days..."
+BASE_REPOS="$HOME/SUDARSHAN_CODE/sudarshan_repos"
+now=$(date +%s)
+for repo in "$BASE_REPOS"/*/; do
+  [ -d "$repo/node_modules" ] || continue
+  last_commit=$(git -C "$repo" log -1 --format="%at" 2>/dev/null || echo 0)
+  age=$(( (now - last_commit) / 86400 ))
+  if [ "$age" -gt 7 ]; then
+    size=$(du -sh "$repo/node_modules" 2>/dev/null | cut -f1)
+    rm -rf "$repo/node_modules"
+    echo "  Removed: $(basename $repo)/node_modules ($size, last commit ${age}d ago)"
+  fi
+done
 echo "Done."
 
 # ── STEP 4 — Clean Android Studio caches ──────────
