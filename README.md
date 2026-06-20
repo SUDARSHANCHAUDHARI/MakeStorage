@@ -1,5 +1,9 @@
 # MakeStorage
 
+![Platform](https://img.shields.io/badge/platform-macOS-blue)
+![Shell](https://img.shields.io/badge/bash-3.2%2B-lightgrey)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 A safe CLI that reclaims Android-developer disk space on macOS. It clears the things that silently eat tens of gigabytes — `.gradle` caches, stale `build/` directories, old Gradle wrapper versions, Android Studio caches, and idle `node_modules` — while **preserving your APK and AAB artifacts**.
 
 Destructive by nature, safe by default: nothing is deleted without a `--dry-run` preview or an explicit confirmation prompt.
@@ -30,6 +34,31 @@ makestorage setup       # install a weekly launchd job (Sundays 9am)
 makestorage uninstall   # remove the weekly job
 makestorage config      # print / create the config file
 ```
+
+### Example
+
+```console
+$ makestorage status --root ~/code/android
+MakeStorage — reclaimable space
+roots: /Users/you/code/android
+
+Project .gradle folders
+  reclaimable: 1.2G across 8 item(s)
+Build dirs (APK/AAB preserved)
+  reclaimable: 3.4G across 22 item(s)
+Gradle caches (>30d)
+  reclaimable: 3.7G across 5 item(s)
+Old Gradle wrapper versions
+  reclaimable: 968.5M across 5 item(s)
+Idle node_modules (>7d)
+  reclaimable: 540.0M across 3 item(s)
+Android Studio caches & logs
+  reclaimable: 287.0M across 1 item(s)
+
+Total reclaimable: 9.9G
+```
+
+Then `makestorage clean` shows the same breakdown and asks once before deleting.
 
 ### Point it at your projects
 
@@ -81,6 +110,10 @@ NODE_IDLE_DAYS=7     # delete node_modules from repos idle longer than N days
 - Kotlin/JVM compiler cache (`~/.kotlin/`) and AVD image cleanup
 - Homebrew tap
 - Optional single-binary rewrite (Go/Rust)
+
+## Contributing
+
+Issues and pull requests welcome at [github.com/SUDARSHANCHAUDHARI/MakeStorage](https://github.com/SUDARSHANCHAUDHARI/MakeStorage). It's a single Bash script — keep changes safe-by-default (dry-run + confirmation) and macOS-friendly.
 
 ## Author
 
