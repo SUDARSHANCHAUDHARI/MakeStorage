@@ -1,0 +1,28 @@
+# User/plugin config — personal data, never commit
+.claude-plugin-config.json
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Logs
+*.log
+
+# Secrets
+*.env
+secrets.*
+credentials.*
+PLAN.md
+
+# graphify knowledge graph
+graphify-out/
