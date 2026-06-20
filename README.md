@@ -33,7 +33,7 @@ makestorage config      # print / create the config file
 
 ### Point it at your projects
 
-By default it scans `~/SUDARSHAN_CODE/sudarshan_repos`. Override per-run:
+By default it scans the **current directory**. Point it elsewhere per-run:
 
 ```bash
 makestorage clean --root ~/code/android --root ~/work/apps
