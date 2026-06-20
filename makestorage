@@ -75,9 +75,8 @@ resolve_roots() {
   if [ "${#CLI_ROOTS[@]}" -gt 0 ]; then
     ROOTS=("${CLI_ROOTS[@]}")
   elif [ "${#ROOTS[@]}" -eq 0 ]; then
-    # backwards-compatible default
-    local d="$HOME/SUDARSHAN_CODE/sudarshan_repos"
-    [ -d "$d" ] && ROOTS=("$d")
+    # default to the current directory
+    ROOTS=("$PWD")
   fi
   if [ "${#ROOTS[@]}" -eq 0 ]; then
     die "No project roots configured. Pass --root PATH or run: makestorage config"
@@ -95,7 +94,7 @@ cmd_config() {
 # makestorage config — sourced as bash
 # One or more project roots to scan for .gradle / build / node_modules:
 ROOTS=(
-  "\$HOME/SUDARSHAN_CODE/sudarshan_repos"
+  "\$HOME/code"
 )
 # Delete ~/.gradle/caches entries older than N days:
 CACHE_DAYS=$CACHE_DAYS
