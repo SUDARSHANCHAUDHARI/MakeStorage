@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+#
+# makestorage — reclaim Android-dev disk space on macOS.
+#
+# Cleans Gradle caches, stale build/ output, Android Studio caches, and
+# idle node_modules — while preserving APK/AAB artifacts. Safe by default:
+# nothing is deleted without --dry-run preview or an explicit confirmation.
+#
+# Usage:
+#   makestorage clean   [--dry-run] [--stats] [--yes] [--root PATH]...
+#   makestorage status  [--root PATH]...
+#   makestorage setup   [--root PATH]...      # install weekly launchd job
+#   makestorage uninstall                     # remove the launchd job
+#   makestorage config                        # print/create config file
+#   makestorage help
+#
+set -uo pipefail
+
+VERSION="1.0.0"
+LABEL="com.sudarshantechlabs.makestorage"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/makestorage"
+CONFIG_FILE="$CONFIG_DIR/config"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG_FILE="$HOME/Library/Logs/makestorage.log"
+
+# Tunables (overridable in config)
+CACHE_DAYS=30        # delete ~/.gradle/caches entries older than this
+NODE_IDLE_DAYS=7     # delete node_modules from repos idle longer than this
+
+# Runtime flags
+DRY_RUN=0
+ASSUME_YES=0
+SHOW_STATS=0
+declare -a CLI_ROOTS=()
+declare -a ROOTS=()
+
+# ── output helpers ────────────────────────────────────────────────
+c_reset=$'\033[0m'; c_dim=$'\033[2m'; c_bold=$'\033[1m'
+c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_red=$'\033[31m'
+say()  { printf '%s\n' "$*"; }
+hdr()  { printf '\n%s%s%s\n' "$c_bold" "$*" "$c_reset"; }
+warn() { printf '%s%s%s\n' "$c_ylw" "$*" "$c_reset" >&2; }
+die()  { printf '%s%s%s\n' "$c_red" "$*" "$c_reset" >&2; exit 1; }
+
+human() {  # KB -> human readable
+  local kb=${1:-0}
+  if   [ "$kb" -ge 1048576 ]; then awk "BEGIN{printf \"%.1fG\", $kb/1048576}"
+  elif [ "$kb" -ge 1024 ];    then awk "BEGIN{printf \"%.1fM\", $kb/1024}"
+  else printf '%dK' "$kb"; fi
+}
+
+# ── safety ────────────────────────────────────────────────────────
+# Never rm an empty, root, or home path — a typo must not nuke the disk.
+safe_rm() {
+  local p="$1"
+  [ -n "$p" ] || { warn "skip: empty path"; return 1; }
+  case "$p" in
+    /|"$HOME"|"$HOME"/|"$HOME"/.gradle|"$HOME"/Library)
+      warn "REFUSING to delete protected path: $p"; return 1;;
+  esac
+  rm -rf -- "$p"
+}
+
+dir_kb() { du -sk "$1" 2>/dev/null | cut -f1; }
+
+# ── config ────────────────────────────────────────────────────────
+load_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+}
+
+resolve_roots() {
+  if [ "${#CLI_ROOTS[@]}" -gt 0 ]; then
+    ROOTS=("${CLI_ROOTS[@]}")
+  elif [ "${#ROOTS[@]}" -eq 0 ]; then
+    # backwards-compatible default
+    local d="$HOME/SUDARSHAN_CODE/sudarshan_repos"
+    [ -d "$d" ] && ROOTS=("$d")
+  fi
+  if [ "${#ROOTS[@]}" -eq 0 ]; then
+    die "No project roots configured. Pass --root PATH or run: makestorage config"
+  fi
+  local r
+  for r in "${ROOTS[@]}"; do
+    [ -d "$r" ] || warn "warning: root does not exist: $r"
+  done
+}
+
+cmd_config() {
+  if [ ! -f "$CONFIG_FILE" ]; then
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+# makestorage config — sourced as bash
+# One or more project roots to scan for .gradle / build / node_modules:
+ROOTS=(
+  "\$HOME/SUDARSHAN_CODE/sudarshan_repos"
+)
+# Delete ~/.gradle/caches entries older than N days:
+CACHE_DAYS=$CACHE_DAYS
+# Delete node_modules from repos idle longer than N days:
+NODE_IDLE_DAYS=$NODE_IDLE_DAYS
+EOF
+    say "Created config: $CONFIG_FILE"
+  else
+    say "Config: $CONFIG_FILE"
+  fi
+  say ""
+  cat "$CONFIG_FILE"
+}
+
+# ── target listers (emit absolute paths, one per line) ────────────
+list_project_gradle() {
+  local r
+  for r in "${ROOTS[@]}"; do
+    [ -d "$r" ] && find "$r" -name ".gradle" -type d -prune 2>/dev/null
+  done
+}
+
+list_build_targets() {
+  local r b
+  for r in "${ROOTS[@]}"; do
+    [ -d "$r" ] || continue
+    find "$r" -path "*/build" -type d 2>/dev/null | while IFS= read -r b; do
+      # everything under build/ except the outputs dir
+      find "$b" -mindepth 1 -maxdepth 1 -type d ! -name outputs 2>/dev/null
+      # under outputs/, everything except the apk + bundle artifacts
+      if [ -d "$b/outputs" ]; then
+        find "$b/outputs" -mindepth 1 -maxdepth 1 -type d \
+          ! -name apk ! -name bundle 2>/dev/null
+      fi
+    done
+  done
+}
+
+list_gradle_caches() {
+  [ -d "$HOME/.gradle/caches" ] || return 0
+  find "$HOME/.gradle/caches" -maxdepth 1 -mindepth 1 -type d \
+    -mtime +"$CACHE_DAYS" 2>/dev/null
+}
+
+list_gradle_wrappers() {
+  local d="$HOME/.gradle/wrapper/dists"
+  [ -d "$d" ] || return 0
+  # keep the most recently modified wrapper dir, list the rest (dirs only)
+  find "$d" -maxdepth 1 -mindepth 1 -type d -exec stat -f '%m %N' {} \; 2>/dev/null \
+    | sort -rn | tail -n +2 | cut -d' ' -f2-
+}
+
+list_idle_node_modules() {
+  local r repo now last age
+  now=$(date +%s)
+  for r in "${ROOTS[@]}"; do
+    [ -d "$r" ] || continue
+    for repo in "$r"/*/; do
+      [ -d "${repo}node_modules" ] || continue
+      last=$(git -C "$repo" log -1 --format="%at" 2>/dev/null || echo 0)
+      [ -n "$last" ] || last=0
+      age=$(( (now - last) / 86400 ))
+      [ "$age" -gt "$NODE_IDLE_DAYS" ] && printf '%snode_modules\n' "$repo"
+    done
+  done
+}
+
+list_androidstudio() {
+  local p
+  for p in "$HOME"/Library/Caches/Google/AndroidStudio* "$HOME/Library/Logs/Google"; do
+    [ -e "$p" ] && printf '%s\n' "$p"
+  done
+}
+
+# ── category processor ────────────────────────────────────────────
+# run_category "Label" lister_fn
+# Honors DRY_RUN. Returns freed/reclaimable KB via global LAST_KB.
+LAST_KB=0
+run_category() {
+  local label="$1" lister="$2"
+  local total=0 count=0 kb p
+  hdr "$label"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ -e "$p" ] || continue
+    kb=$(dir_kb "$p"); kb=${kb:-0}
+    total=$((total + kb)); count=$((count + 1))
+    if [ "$DRY_RUN" -eq 1 ]; then
+      printf '  %swould remove%s %8s  %s\n' "$c_dim" "$c_reset" "$(human "$kb")" "$p"
+    else
+      safe_rm "$p" && printf '  %sremoved%s      %8s  %s\n' "$c_grn" "$c_reset" "$(human "$kb")" "$p"
+    fi
+  done < <("$lister")
+  LAST_KB=$total
+  if [ "$count" -eq 0 ]; then
+    printf '  %snothing to clean%s\n' "$c_dim" "$c_reset"
+  else
+    local verb="reclaimable"; [ "$DRY_RUN" -eq 0 ] && verb="freed"
+    printf '  %s%s: %s across %d item(s)%s\n' "$c_bold" "$verb" "$(human "$total")" "$count" "$c_reset"
+  fi
+}
+
+# ── commands ──────────────────────────────────────────────────────
+GRAND_KB=0
+run_all() {
+  GRAND_KB=0
+  local cats=(
+    "Project .gradle folders|list_project_gradle"
+    "Build dirs (APK/AAB preserved)|list_build_targets"
+    "Gradle caches (>${CACHE_DAYS}d)|list_gradle_caches"
+    "Old Gradle wrapper versions|list_gradle_wrappers"
+    "Idle node_modules (>${NODE_IDLE_DAYS}d)|list_idle_node_modules"
+    "Android Studio caches & logs|list_androidstudio"
+  )
+  local c
+  for c in "${cats[@]}"; do
+    run_category "${c%%|*}" "${c##*|}"
+    GRAND_KB=$((GRAND_KB + LAST_KB))
+  done
+}
+
+cmd_status() {
+  resolve_roots
+  DRY_RUN=1
+  say "${c_bold}MakeStorage — reclaimable space${c_reset}"
+  say "${c_dim}roots: ${ROOTS[*]}${c_reset}"
+  run_all
+  hdr "Total reclaimable: $(human "$GRAND_KB")"
+}
+
+cmd_clean() {
+  resolve_roots
+  say "${c_bold}MakeStorage — cleanup${c_reset}"
+  say "${c_dim}roots: ${ROOTS[*]}${c_reset}"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    run_all
+    hdr "Dry run — nothing deleted. Total reclaimable: $(human "$GRAND_KB")"
+    return 0
+  fi
+
+  if [ "$ASSUME_YES" -ne 1 ]; then
+    # preview first, then confirm
+    DRY_RUN=1; run_all; DRY_RUN=0
+    printf '\n%sDelete the above (%s)? [y/N] %s' "$c_ylw" "$(human "$GRAND_KB")" "$c_reset"
+    read -r ans
+    case "$ans" in y|Y|yes|YES) ;; *) say "Aborted."; return 1;; esac
+  fi
+
+  run_all
+  apply_gradle_props
+  hdr "Done. Freed approximately $(human "$GRAND_KB")."
+  [ "$SHOW_STATS" -eq 1 ] && say "${c_dim}log: $LOG_FILE${c_reset}"
+}
+
+apply_gradle_props() {
+  local f="$HOME/.gradle/gradle.properties"
+  mkdir -p "$HOME/.gradle"
+  if grep -q "org.gradle.daemon" "$f" 2>/dev/null; then return 0; fi
+  cat >> "$f" <<'EOF'
+org.gradle.daemon=true
+org.gradle.parallel=true
+org.gradle.caching=true
+org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g
+EOF
+  say "${c_dim}Applied global Gradle performance settings.${c_reset}"
+}
+
+cmd_setup() {
+  resolve_roots
+  local self; self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  local args="clean --yes"
+  local r; for r in "${ROOTS[@]}"; do args+=" --root \"$r\""; done
+
+  mkdir -p "$(dirname "$PLIST")"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>$self $args >> "$LOG_FILE" 2>&1</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>0</integer>
+    <key>Hour</key><integer>9</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardErrorPath</key><string>$LOG_FILE</string>
+  <key>StandardOutPath</key><string>$LOG_FILE</string>
+</dict>
+</plist>
+EOF
+  launchctl unload "$PLIST" 2>/dev/null
+  launchctl load "$PLIST" 2>/dev/null && \
+    say "Installed weekly cleanup (Sundays 9am) → $PLIST" || \
+    warn "Wrote $PLIST but launchctl load failed — load it manually."
+  say "${c_dim}log: $LOG_FILE${c_reset}"
+}
+
+cmd_uninstall() {
+  if [ -f "$PLIST" ]; then
+    launchctl unload "$PLIST" 2>/dev/null
+    rm -f "$PLIST"
+    say "Removed weekly cleanup job."
+  else
+    say "No launchd job installed."
+  fi
+}
+
+usage() {
+  cat <<EOF
+${c_bold}makestorage v$VERSION${c_reset} — reclaim Android-dev disk space (macOS)
+
+${c_bold}Commands${c_reset}
+  clean        Clean caches/build output (asks before deleting)
+  status       Show reclaimable space without deleting anything
+  setup        Install a weekly launchd cleanup job (Sun 9am)
+  uninstall    Remove the weekly launchd job
+  config       Print or create the config file
+  help         Show this help
+
+${c_bold}Flags (clean)${c_reset}
+  --dry-run    Preview what would be deleted, delete nothing
+  --yes, -y    Skip the confirmation prompt (used by the cron job)
+  --stats      Print log path after cleaning
+  --root PATH  Project root to scan (repeatable; overrides config)
+
+${c_bold}Config${c_reset}  $CONFIG_FILE
+EOF
+}
+
+# ── arg parsing ───────────────────────────────────────────────────
+main() {
+  load_config
+  local cmd="${1:-help}"; shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run)   DRY_RUN=1 ;;
+      --yes|-y)    ASSUME_YES=1 ;;
+      --stats)     SHOW_STATS=1 ;;
+      --root)      shift; [ -n "${1:-}" ] || die "--root needs a PATH"; CLI_ROOTS+=("$1") ;;
+      -h|--help)   usage; exit 0 ;;
+      *)           die "unknown option: $1" ;;
+    esac
+    shift
+  done
+
+  case "$cmd" in
+    clean)            cmd_clean ;;
+    status|stats)     cmd_status ;;
+    setup)            cmd_setup ;;
+    uninstall)        cmd_uninstall ;;
+    config)           cmd_config ;;
+    help|-h|--help)   usage ;;
+    *)                usage; exit 1 ;;
+  esac
+}
+
+main "$@"
