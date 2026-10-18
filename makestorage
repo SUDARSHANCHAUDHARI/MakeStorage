@@ -122,6 +122,8 @@ list_build_targets() {
   for r in "${ROOTS[@]}"; do
     [ -d "$r" ] || continue
     find "$r" -path "*/build" -type d 2>/dev/null | while IFS= read -r b; do
+      # a build/ with git-tracked files is source, not output — leave it alone
+      [ -n "$(git -C "$b" ls-files 2>/dev/null | head -n 1)" ] && continue
       # everything under build/ except the outputs dir
       find "$b" -mindepth 1 -maxdepth 1 -type d ! -name outputs 2>/dev/null
       # under outputs/, everything except the apk + bundle artifacts
