@@ -156,8 +156,10 @@ list_idle_node_modules() {
     [ -d "$r" ] || continue
     for repo in "$r"/*/; do
       [ -d "${repo}node_modules" ] || continue
-      last=$(git -C "$repo" log -1 --format="%at" 2>/dev/null || echo 0)
-      [ -n "$last" ] || last=0
+      last=$(git -C "$repo" log -1 --format="%at" 2>/dev/null)
+      # no git date (not a repo): fall back to folder mtime; neither known -> never delete
+      [ -n "$last" ] || last=$(stat -f %m "$repo" 2>/dev/null)
+      [ -n "$last" ] || continue
       age=$(( (now - last) / 86400 ))
       [ "$age" -gt "$NODE_IDLE_DAYS" ] && printf '%snode_modules\n' "$repo"
     done
@@ -183,12 +185,14 @@ run_category() {
     [ -n "$p" ] || continue
     [ -e "$p" ] || continue
     kb=$(dir_kb "$p"); kb=${kb:-0}
-    total=$((total + kb)); count=$((count + 1))
     if [ "$DRY_RUN" -eq 1 ]; then
       printf '  %swould remove%s %8s  %s\n' "$c_dim" "$c_reset" "$(human "$kb")" "$p"
+    elif safe_rm "$p"; then
+      printf '  %sremoved%s      %8s  %s\n' "$c_grn" "$c_reset" "$(human "$kb")" "$p"
     else
-      safe_rm "$p" && printf '  %sremoved%s      %8s  %s\n' "$c_grn" "$c_reset" "$(human "$kb")" "$p"
+      continue  # safe_rm refused: not freed, not counted
     fi
+    total=$((total + kb)); count=$((count + 1))
   done < <("$lister")
   LAST_KB=$total
   if [ "$count" -eq 0 ]; then
@@ -249,7 +253,7 @@ cmd_clean() {
   run_all
   apply_gradle_props
   hdr "Done. Freed approximately $(human "$GRAND_KB")."
-  [ "$SHOW_STATS" -eq 1 ] && say "${c_dim}log: $LOG_FILE${c_reset}"
+  if [ "$SHOW_STATS" -eq 1 ]; then say "${c_dim}log: $LOG_FILE${c_reset}"; fi
 }
 
 apply_gradle_props() {
@@ -282,7 +286,7 @@ cmd_setup() {
   <array>
     <string>/bin/bash</string>
     <string>-c</string>
-    <string>$self $args >> "$LOG_FILE" 2>&1</string>
+    <string>$self $args</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
